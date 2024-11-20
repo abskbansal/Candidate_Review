@@ -2,6 +2,7 @@ from flask import Flask, request, jsonify
 from flask_mysqldb import MySQL
 from flask_cors import CORS
 import os
+from passlib.hash import bcrypt  # Import bcrypt for password hashing
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -38,9 +39,12 @@ def signup():
     if existing_user:
         return jsonify({"error": "Email already registered."}), 400  # Return a 400 error if email exists
     
+    # Hash the password using bcrypt
+    hashed_password = bcrypt.hash(password)
+    
     # If email doesn't exist, proceed to insert the new user
     query = "INSERT INTO Users (email, password, name, phone, date_of_birth, resume_url) VALUES (%s, %s, %s, %s, %s, %s)"
-    cursor.execute(query, (email, password, name, phone, date_of_birth, resume_url))
+    cursor.execute(query, (email, hashed_password, name, phone, date_of_birth, resume_url))
     mysql.connection.commit()
     
     return jsonify({"message": "User registered successfully!"}), 200
@@ -51,22 +55,24 @@ def get_profile(email):
     cursor = mysql.connection.cursor()
 
     # Fetch user data from MySQL
-    query = "SELECT * FROM Users WHERE email = %s"
+    query = "SELECT (email, password, name, phone, date_of_birth, resume_url) FROM Users WHERE email = %s"
     cursor.execute(query, [email])
 
     user = cursor.fetchone()
-
     cursor.close()
 
     if user:
         # Return user data as JSON response
-        return jsonify({
-            "email": user[1],  # Index corresponds to the column in the query result
-            "name": user[2],
-            "phone": user[3],
-            "date_of_birth": user[4],
-            "resume_url": user[5]
-        })
+        return jsonify(
+            {
+                "email": user[0],
+                "password": user[1],
+                "name": user[2],
+                "phone": user[3],
+                "date_of_birth": user[4],
+                "resume_url": user[5]
+            }
+        )
     else:
         return jsonify({"error": "User not found"}), 404
 
