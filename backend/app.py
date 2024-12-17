@@ -1,16 +1,24 @@
 from flask import Flask, json, request, jsonify
 from flask_mysqldb import MySQL
 from flask_cors import CORS
+from flask_mail import Mail, Message
+from werkzeug.utils import secure_filename
 import os
 import boto3
+import pyotp
 import bcrypt
-from werkzeug.utils import secure_filename
+import traceback
+import redis
+
+from my_ats import evaluate_resume_content
 
 from dotenv import load_dotenv
 load_dotenv()
 
 app = Flask(__name__)
 CORS(app)
+
+redis_client = redis.StrictRedis(host='localhost', port=6379, db=0, decode_responses=True)
 
 app.config['MYSQL_HOST'] = os.getenv('DB_HOST')
 app.config['MYSQL_USER'] = os.getenv('DB_USER')
@@ -28,6 +36,18 @@ s3 = boto3.client(
     aws_access_key_id=AWS_ACCESS_KEY,
     aws_secret_access_key=AWS_SECRET_KEY,
 )
+
+SECRET_BASE = pyotp.random_base32()
+totp = pyotp.TOTP(SECRET_BASE, digits=6)
+
+app.config['MAIL_SERVER'] = 'smtp.hostinger.com'
+app.config['MAIL_PORT'] = 587
+app.config['MAIL_USE_TLS'] = True
+app.config['MAIL_USE_SSL'] = False
+app.config['MAIL_USERNAME'] = os.getenv('MAIL_USERNAME')
+app.config['MAIL_PASSWORD'] = os.getenv('MAIL_PASSWORD')
+
+mail = Mail(app)
 
 ALLOWED_EXTENSIONS = {'pdf', 'docx'}
 MAX_FILE_SIZE = 10 * 1024 * 1024
@@ -133,6 +153,111 @@ def check_creds():
             return jsonify({"error": "Invalid password"}), 403
     else:
         return jsonify({"error": "Email not found"}), 404
+
+@app.route('/evaluate-resume/<email>', methods=['GET'])
+def evaluate_resume(email):
+    """
+    Flask endpoint to evaluate a resume's ATS score.
+    :param email: User email to fetch the resume link from the database.
+    """
+    try:
+        # 1. Retrieve Resume URL from MySQL Database
+        cursor = mysql.connection.cursor()
+        query = "SELECT resume_url FROM Users WHERE email = %s"
+        cursor.execute(query, (email,))
+        result = cursor.fetchone()
+        
+        if not result:
+            return jsonify({
+                "email": email,
+                "message": "No resume found for the provided email."
+            }), 404
+        
+        resume_url = result[0]  # Extract resume_url
+        cursor.close()
+
+        # 2. Extract S3 Bucket and Key from the Resume URL
+        if not resume_url.startswith("https://"):
+            return jsonify({"message": "Invalid S3 URL format."}), 400
+        
+        # Assuming the S3 URL format is: https://<bucket-name>.s3.<region>.amazonaws.com/<file-key>
+        parts = resume_url.split('/')
+        bucket_name = parts[2].split('.')[0]  # Extract bucket name
+        file_key = '/'.join(parts[3:])  # Extract the file path (key)
+
+        # 3. Fetch Resume from S3
+        try:
+            s3_object = s3.get_object(Bucket=bucket_name, Key=file_key)
+            resume_content = s3_object['Body'].read()  # File content in bytes
+        except Exception as s3_error:
+            print(f"S3 Error: {s3_error}")
+            return jsonify({
+                "email": email,
+                "message": "Failed to fetch resume from S3."
+            }), 500
+
+        # 4. Evaluate ATS Score
+        ats_score = evaluate_resume_content(resume_content)
+
+        # 5. Respond with ATS Score
+        return jsonify({
+            "email": email,
+            "ats_score": ats_score,
+            "message": "Resume evaluated successfully."
+        }), 200
+
+    except Exception as e:
+        print(f"Unexpected error: {e}")
+        traceback.print_exc()
+        return jsonify({
+            "email": email,
+            "message": "An unexpected error occurred. Please try again later."
+        }), 500
+    
+@app.route('/send-otp/<email>', methods=['GET'])
+def send_otp(email):
+    try:
+        if not email or '@' not in email:
+            return jsonify({"error": "Valid email is required"}), 400
+
+        otp = totp.now()
+        redis_client.setex(f"otp:{email}", 120, otp)
+
+        subject = "Your OTP Code"
+        body = f"Your OTP for registration is: {otp}. This OTP is valid for 2 minutes."
+        sender = os.getenv('MAIL_USERNAME')
+        message = Message(subject=subject, recipients=[email], body=body, sender=sender)
+        mail.send(message)
+
+        return jsonify({"message": "OTP sent successfully"}), 200
+
+    except Exception as e:
+        print(f"Error sending OTP: {str(e)}")
+        return jsonify({"error": "Failed to send OTP"}), 500
+
+@app.route('/verify-otp', methods=['POST'])
+def verify_otp():
+    try:
+        email = request.form['email']
+        otp = request.form['otp']
+
+        if not email or not otp:
+            return jsonify({"error": "Email and OTP are required"}), 400
+
+        stored_otp = redis_client.get(f"otp:{email}")
+
+        if not stored_otp:
+            return jsonify({"message": "OTP expired or invalid"}), 403
+
+        if otp == stored_otp:
+            redis_client.delete(f"otp:{email}")
+            return jsonify({"message": "OTP verified successfully"}), 200
+        else:
+            return jsonify({"message": "Incorrect OTP"}), 403
+
+    except Exception as e:
+        print(f"Error verifying OTP: {str(e)}")
+        return jsonify({"error": "Failed to verify OTP"}), 500
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", debug=True)
