@@ -236,8 +236,9 @@ def send_otp(email):
 @app.route('/verify-otp', methods=['POST'])
 def verify_otp():
     try:
-        email = request.form['email']
-        otp = request.form['otp']
+        data = request.get_json()
+        email = data['email']
+        otp = data['otp']
 
         if not email or not otp:
             return jsonify({"error": "Email and OTP are required"}), 400
