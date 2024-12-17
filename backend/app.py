@@ -1,81 +1,138 @@
-from flask import Flask, request, jsonify
+from flask import Flask, json, request, jsonify
 from flask_mysqldb import MySQL
 from flask_cors import CORS
 import os
-from passlib.hash import bcrypt  # Import bcrypt for password hashing
+import boto3
+import bcrypt
+from werkzeug.utils import secure_filename
 
 from dotenv import load_dotenv
 load_dotenv()
 
-# Initialize the Flask application
 app = Flask(__name__)
-CORS(app)  # Enable Cross-Origin Resource Sharing (CORS) for the frontend to connect
+CORS(app)
 
-# Database Configuration
-app.config['MYSQL_HOST'] = os.getenv('DB_HOST', 'your_host')  # Replace with Hostinger DB Host
-app.config['MYSQL_USER'] = os.getenv('DB_USER', 'your_username')  # Replace with your DB username
-app.config['MYSQL_PASSWORD'] = os.getenv('DB_PASSWORD', 'your_password')  # Replace with your DB password
-app.config['MYSQL_DB'] = os.getenv('DB_NAME', 'your_database_name')  # Replace with your DB name
+app.config['MYSQL_HOST'] = os.getenv('DB_HOST')
+app.config['MYSQL_USER'] = os.getenv('DB_USER')
+app.config['MYSQL_PASSWORD'] = os.getenv('DB_PASSWORD')
+app.config['MYSQL_DB'] = os.getenv('DB_NAME')
 
-# Initialize MySQL
 mysql = MySQL(app)
 
-# Signup Route
-@app.route('/signup', methods=['POST'])
-def signup():
-    # Get form data
-    email = request.args.get('email')
-    password = request.args.get('password')
-    name = request.args.get('name')
-    phone = request.args.get('phone')
-    date_of_birth = request.args.get('dateOfBirth')
-    resume_url = request.args.get('resumeUrl')
-    
-    # Check if the email already exists in the database
-    cursor = mysql.connection.cursor()
-    cursor.execute("SELECT * FROM Users WHERE email = %s", (email,))
-    existing_user = cursor.fetchone()
-    
-    if existing_user:
-        return jsonify({"error": "Email already registered."}), 400  # Return a 400 error if email exists
-    
-    # Hash the password using bcrypt
-    hashed_password = bcrypt.hash(password)
-    
-    # If email doesn't exist, proceed to insert the new user
-    query = "INSERT INTO Users (email, password, name, phone, date_of_birth, resume_url) VALUES (%s, %s, %s, %s, %s, %s)"
-    cursor.execute(query, (email, hashed_password, name, phone, date_of_birth, resume_url))
-    mysql.connection.commit()
-    
-    return jsonify({"message": "User registered successfully!"}), 200
+AWS_ACCESS_KEY = os.getenv('AWS_ACCESS_KEY')
+AWS_SECRET_KEY = os.getenv('AWS_SECRET_KEY')
+AWS_BUCKET_NAME = os.getenv('AWS_BUCKET_NAME')
 
-# Profile Details Route (Retrieve user data)
-@app.route('/profile/<email>', methods=['GET'])
-def get_profile(email):
+s3 = boto3.client(
+    's3',
+    aws_access_key_id=AWS_ACCESS_KEY,
+    aws_secret_access_key=AWS_SECRET_KEY,
+)
+
+ALLOWED_EXTENSIONS = {'pdf', 'docx'}
+MAX_FILE_SIZE = 10 * 1024 * 1024
+SALT = bcrypt.gensalt()
+
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+@app.route('/getuser/<email>', methods=['GET'])
+def getuser(email):
     cursor = mysql.connection.cursor()
 
-    # Fetch user data from MySQL
-    query = "SELECT (email, password, name, phone, date_of_birth, resume_url) FROM Users WHERE email = %s"
-    cursor.execute(query, [email])
-
+    cursor.execute('SELECT email, password, name, phone, date_of_birth, resume_url FROM Users WHERE email = %s', (email,))
     user = cursor.fetchone()
+
     cursor.close()
 
     if user:
-        # Return user data as JSON response
-        return jsonify(
-            {
-                "email": user[0],
-                "password": user[1],
-                "name": user[2],
-                "phone": user[3],
-                "date_of_birth": user[4],
-                "resume_url": user[5]
-            }
-        )
+        return jsonify({"error": "User found"}), 404
     else:
-        return jsonify({"error": "User not found"}), 404
+        return jsonify({"success": "User not found"}), 201
 
-# Run the Flask application
+@app.route('/signup', methods=['POST'])
+def signup():
+    data = request.form.get('data')
+    if data:
+        data = json.loads(data)
+
+    print(data)
+
+    name = data['name']
+    email = data['email']
+    phone = data['phone']
+    dob = data['dob']
+    password = data['password']
+    hashed_password = bcrypt.hashpw(password.encode('utf-8'), SALT)
+
+    resume = request.files.get('file')
+
+    if resume and allowed_file(resume.filename):
+        filename = secure_filename(resume.filename)
+        try:
+            s3.upload_fileobj(resume, AWS_BUCKET_NAME, f'resumes/{filename}')
+            file_url = f'https://{AWS_BUCKET_NAME}.s3.ap-south-1.amazonaws.com/resumes/{filename}'
+        except Exception as e:
+            return jsonify({"error": "File upload to S3 failed", "message": str(e)}), 500
+    else:
+        return jsonify({"error": "Invalid file type or file size exceeded the limit"}), 400
+
+    cursor = mysql.connection.cursor()
+
+    try:
+        cursor.execute(
+            '''INSERT INTO Users (name, email, phone, date_of_birth, password, resume_url) 
+               VALUES (%s, %s, %s, %s, %s, %s)''', 
+            (name, email, phone, dob, hashed_password, file_url)
+        )
+        mysql.connection.commit()
+        return jsonify({
+            'name': name,
+            'email': email,
+            'phone': phone,
+            'dob': dob,
+            'resume': file_url
+        }), 201
+
+    except Exception as e:
+        mysql.connection.rollback()
+        return jsonify({"error": "Database error", "message": str(e)}), 500
+
+    finally:
+        cursor.close()
+
+@app.route('/check-creds', methods=['POST'])
+def check_creds():
+    email = request.form['email']
+    password = request.form['password']
+
+    print(email, password)
+    
+    cursor = mysql.connection.cursor()
+
+    # Query to select user based on both email and password
+    cursor.execute('SELECT email, password, name, phone, date_of_birth, resume_url FROM Users WHERE email = %s', (email,))
+    user = cursor.fetchone()
+    
+    cursor.close()
+
+    if user:
+        u_password = user[1]
+        if bcrypt.checkpw(password.encode("utf-8"), u_password.encode("utf-8")):
+            print("Hogyaaaaaaa")
+            return jsonify(
+                {
+                    "email": user[0],
+                    "name": user[2],
+                    "phone": user[3],
+                    "date_of_birth": user[4],
+                    "resume_url": user[5]
+                }
+            )
+        else:
+            return jsonify({"error": "Invalid password"}), 403
+    else:
+        return jsonify({"error": "Email not found"}), 404
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", debug=True)
